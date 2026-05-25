@@ -92,10 +92,10 @@
 
   #speedVal {
     font-family: 'Orbitron', monospace;
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 700;
     color: #ff3c00;
-    min-width: 20px;
+    min-width: 60px;
     text-align: right;
   }
 
@@ -160,11 +160,11 @@
   <div id="controls">
     <div class="speed-group">
       <span class="speed-label">Speed</span>
-      <input type="range" id="speedSlider" min="1" max="10" value="4" step="1">
-      <span id="speedVal">4</span>
+      <input type="range" id="speedSlider" min="10" max="100" value="40" step="10">
+      <span id="speedVal">40 km/h</span>
     </div>
     <div id="stats">
-      <div class="stat"><span class="stat-label">Score</span><span class="stat-val" id="scoreEl">0</span></div>
+      <div class="stat"><span class="stat-label">Coins</span><span class="stat-val" id="scoreEl">0/100</span></div>
       <div class="stat"><span class="stat-label">Best</span><span class="stat-val" id="hiEl">0</span></div>
     </div>
     <button id="startBtn" onclick="toggleGame()">START</button>
@@ -179,13 +179,28 @@ const W = 480, H = 580;
 canvas.width = W; canvas.height = H;
 
 // ---- State ----
-let state = 'idle'; // idle | running | over
+let state = 'idle'; // idle | running | over | finish
 let score = 0, hiScore = 0, frame = 0;
-let speedLevel = 4;
+let kmh = 40; // 10~100 km/h
 
 // ---- Road geometry ----
 const RL = 100, RR = 380, RW = RR - RL;
 const LC = (RL + RR) / 2;
+
+// ---- Distance / Finish ----
+// 100 km/h → getSpeed()=10 px/frame @60fps → 600 px/s
+// 1 min at 100 km/h = 60s × 600 px/s = 36000 total game pixels
+const FINISH_DIST = 36000;
+const COIN_SET_TOTAL = 100;
+let distTravelled = 0;
+let finishLineY = null;
+let finishOffset = 0;
+let elapsedSec = 0;
+let finalScore = 0;
+let hiFinishScore = 0;
+let coinSetSpawned = false; // unused, kept for reset compat
+let nextCoinMilestone = 0;  // next 10%-milestone index to schedule (0–9)
+let pendingCoins = [];      // coins waiting to spawn when distTravelled >= triggerDist
 
 // ---- Car ----
 let car = { x: LC, y: H - 110, w: 38, h: 68 };
@@ -196,16 +211,17 @@ let dashes = [], trees = [], obstacles = [], particles = [], coins = [];
 let obstTimer = 0, coinTimer = 0;
 let coinScore = 0;
 
-function getSpeed() { return speedLevel * 1.3; }
+// px/frame: at 100 km/h → 10 px/frame; linear
+function getSpeed() { return kmh / 10; }
 
 document.getElementById('speedSlider').oninput = function() {
-  speedLevel = +this.value;
-  document.getElementById('speedVal').textContent = speedLevel;
+  kmh = +this.value;
+  document.getElementById('speedVal').textContent = kmh + ' km/h';
 };
 
 function toggleGame() {
-  if (state === 'idle' || state === 'over') startGame();
-  else { endGame('STOPPED'); }
+  if (state === 'idle' || state === 'over' || state === 'finish') startGame();
+  else endGame('STOPPED');
 }
 
 function startGame() {
@@ -213,6 +229,12 @@ function startGame() {
   score = 0; frame = 0;
   car = { x: LC, y: H - 110, w: 38, h: 68 };
   obstacles = []; particles = []; coins = []; obstTimer = 0; coinTimer = 0; coinScore = 0;
+  distTravelled = 0; finishLineY = null; finishOffset = 0; elapsedSec = 0; finalScore = 0;
+  coinSetSpawned = false; nextCoinMilestone = 0; pendingCoins = [];
+  // Pre-schedule all 100 coins across 10 segments
+  for (let b = 0; b < 10; b++) scheduleCoinBatch(b);
+  document.getElementById('scoreEl').textContent = '0';
+  document.getElementById('hiEl').textContent = hiFinishScore;
   dashes = Array.from({length:10}, (_,i) => ({ y: i * 72 - 20 }));
   trees = [];
   for (let i = 0; i < 10; i++) spawnTree(i * 75 - 40);
@@ -220,11 +242,34 @@ function startGame() {
 }
 
 function endGame(reason) {
-  state = 'over';
-  if (coinScore > hiScore) hiScore = coinScore;
-  document.getElementById('hiEl').textContent = hiScore;
+  if (reason === 'FINISH') {
+    state = 'finish';
+    // 만점: 100km/h(60초)로 코인 100개 = 60점
+    // 점수 = (60 / 통과시간) × 60 × (코인/100)
+    const speedRatio = 60 / elapsedSec;
+    finalScore = Math.round(speedRatio * 60 * (coinScore / COIN_SET_TOTAL) * 10) / 10;
+    if (finalScore > hiFinishScore) hiFinishScore = finalScore;
+    document.getElementById('hiEl').textContent = hiFinishScore;
+    spawnFinishCelebration(car.x, car.y);
+  } else {
+    state = 'over';
+    // 중간 게임오버: 진행률 × (60/환산시간) × 60 × (코인/100)
+    // 환산시간 = 간 거리를 현재 속도로 가는 데 걸리는 시간 ≈ elapsedSec
+    const progressRatio = distTravelled / FINISH_DIST;
+    const speedRatio = progressRatio > 0 ? (progressRatio * 60) / elapsedSec : 0;
+    finalScore = Math.round(speedRatio * 60 * (coinScore / COIN_SET_TOTAL) * 10) / 10;
+    spawnCrash(car.x, car.y);
+  }
   document.getElementById('startBtn').textContent = 'RETRY';
-  spawnCrash(car.x, car.y);
+}
+
+function spawnFinishCelebration(x, y) {
+  const confCols = ['#ff3c00','#ffdd57','#00e5ff','#ff69b4','#7fff00','#fff'];
+  for (let i = 0; i < 60; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 2 + Math.random() * 5;
+    particles.push({ x: RL + Math.random()*RW, y: Math.random()*H*0.6, vx: Math.cos(a)*s*0.6, vy: Math.sin(a)*s*0.6 - 2, life: 1, col: confCols[Math.floor(Math.random()*confCols.length)], size: 4+Math.random()*5 });
+  }
 }
 
 // ---- Spawners ----
@@ -249,14 +294,25 @@ function spawnCrash(x, y) {
   }
 }
 
-function spawnCoin() {
-  const laneX = [RL + 50, LC - 40, LC, LC + 40, RR - 50];
-  const x = laneX[Math.floor(Math.random() * laneX.length)] + (Math.random()-0.5)*16;
-  // occasionally spawn a cluster of 3
-  const count = Math.random() < 0.25 ? 3 : 1;
-  for (let i = 0; i < count; i++) {
-    coins.push({ x: x + (i - (count-1)/2) * 36, y: -20 - i * 38, r: 11, angle: Math.random()*Math.PI*2, spin: 0.06 + Math.random()*0.04 });
+function scheduleCoinBatch(batchIndex) {
+  // Schedule 10 coins evenly spread across this 10% segment
+  const segStart = batchIndex * 0.1 * FINISH_DIST;
+  const segEnd   = (batchIndex + 1) * 0.1 * FINISH_DIST;
+  const segSize  = segEnd - segStart;
+  const laneXOptions = [RL + 45, RL + 80, LC - 40, LC, LC + 40, RR - 80, RR - 45];
+
+  for (let i = 0; i < 10; i++) {
+    // Spread evenly + small random jitter so they're not perfectly spaced
+    const t = (i + 0.5 + (Math.random() - 0.5) * 0.7) / 10;
+    const triggerDist = segStart + t * segSize;
+    const laneIdx = Math.floor(Math.random() * laneXOptions.length);
+    pendingCoins.push({
+      triggerDist,
+      x: laneXOptions[laneIdx] + (Math.random() - 0.5) * 16,
+    });
   }
+  // Sort so we can pop from front cheaply
+  pendingCoins.sort((a, b) => a.triggerDist - b.triggerDist);
 }
 
 function spawnCoinCollect(x, y) {
@@ -285,13 +341,14 @@ canvas.addEventListener('touchend', () => { keys['ArrowLeft'] = keys['ArrowRight
 // ---- Update ----
 function update() {
   if (state !== 'running') {
-    particles.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += (p.type === 'text' ? 0 : 0.1); p.life -= (p.type === 'text' ? 0.022 : 0.032); });
+    particles.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += (p.type === 'text' ? 0 : 0.08); p.life -= (p.type === 'text' ? 0.022 : 0.025); });
     particles = particles.filter(p => p.life > 0);
     return;
   }
   frame++;
 
   const spd = getSpeed();
+  distTravelled += spd;
 
   // Move car
   if (keys['ArrowLeft'] || keys['a'] || keys['A']) car.x -= CSPEED;
@@ -311,24 +368,41 @@ function update() {
 
   // Obstacles
   obstTimer++;
-  const interval = Math.max(30, 80 - speedLevel * 4);
+  const interval = Math.max(20, 80 - (kmh - 10) * 0.7);
   if (obstTimer >= interval) { spawnObstacle(); obstTimer = 0; }
   obstacles.forEach(o => { o.y += spd * 0.78; });
   obstacles = obstacles.filter(o => o.y < H + 100);
 
-  // Coins
-  coinTimer++;
-  if (coinTimer >= 55) { spawnCoin(); coinTimer = 0; }
+  // Elapsed time (approx 60fps)
+  elapsedSec += 1 / 60;
+
+  // Coins — spawn individually when distTravelled passes each coin's triggerDist
+  while (pendingCoins.length > 0 && distTravelled >= pendingCoins[0].triggerDist) {
+    const p = pendingCoins.shift();
+    coins.push({ x: p.x, y: -20, r: 11, angle: Math.random() * Math.PI * 2, spin: 0.06 + Math.random() * 0.04 });
+  }
   coins.forEach(c => { c.y += spd * 0.78; c.angle += c.spin; });
   coins = coins.filter(c => c.y < H + 30);
   for (let i = coins.length - 1; i >= 0; i--) {
     const c = coins[i];
     if (Math.abs(car.x - c.x) < car.w*0.5 + c.r && Math.abs(car.y - c.y) < car.h*0.5 + c.r) {
-      coinScore++;
-      if (coinScore > hiScore) hiScore = coinScore;
+      coinScore = Math.min(coinScore + 1, COIN_SET_TOTAL);
       spawnCoinCollect(c.x, c.y);
       coins.splice(i, 1);
     }
+  }
+
+  // Finish line tracking
+  const remaining = FINISH_DIST - distTravelled;
+  if (remaining <= 0 && finishLineY !== null && finishLineY >= car.y) {
+    endGame('FINISH'); return;
+  }
+  // Initialise finish line screen position once it's within view range
+  if (finishLineY === null && remaining <= H * 30) {
+    finishLineY = -remaining; // starts above screen, scrolls down each frame
+  }
+  if (finishLineY !== null) {
+    finishLineY += spd;
   }
 
   // Particles
@@ -342,8 +416,8 @@ function update() {
     }
   }
 
-  document.getElementById('scoreEl').textContent = coinScore;
-  document.getElementById('hiEl').textContent = hiScore;
+  document.getElementById('scoreEl').textContent = `${coinScore}/100`;
+  document.getElementById('hiEl').textContent = hiFinishScore;
 }
 
 // ---- Draw helpers ----
@@ -598,23 +672,22 @@ function drawParticles() {
 function drawHUD() {
   // Speed gauge box
   ctx.fillStyle = 'rgba(0,0,0,0.62)';
-  rr(W - 94, 10, 84, 42, 6); ctx.fill();
+  rr(W - 104, 10, 94, 42, 6); ctx.fill();
   ctx.strokeStyle = 'rgba(255,60,0,0.4)'; ctx.lineWidth = 0.5;
-  rr(W - 94, 10, 84, 42, 6); ctx.stroke();
+  rr(W - 104, 10, 94, 42, 6); ctx.stroke();
   ctx.fillStyle = '#ff3c00';
   ctx.font = 'bold 11px Orbitron, monospace';
   ctx.textAlign = 'center';
-  ctx.fillText(`${speedLevel * 40} km/h`, W - 52, 26);
+  ctx.fillText(`${kmh} km/h`, W - 57, 26);
   ctx.fillStyle = 'rgba(255,60,0,0.5)';
   ctx.font = '8px Orbitron, monospace';
-  ctx.fillText('SPEED', W - 52, 40);
+  ctx.fillText('SPEED', W - 57, 40);
 
   // Coin score box
   ctx.fillStyle = 'rgba(0,0,0,0.62)';
   rr(10, 10, 90, 42, 6); ctx.fill();
   ctx.strokeStyle = 'rgba(255,215,0,0.4)'; ctx.lineWidth = 0.5;
   rr(10, 10, 90, 42, 6); ctx.stroke();
-  // coin icon
   ctx.fillStyle = '#ffd700';
   ctx.shadowColor = '#ffcc00'; ctx.shadowBlur = 5;
   ctx.beginPath(); ctx.arc(28, 26, 7, 0, Math.PI*2); ctx.fill();
@@ -624,36 +697,175 @@ function drawHUD() {
   ctx.textAlign = 'center';
   ctx.fillText('$', 28, 29);
   ctx.fillStyle = '#ffdd57';
-  ctx.font = 'bold 14px Orbitron, monospace';
-  ctx.fillText(`${coinScore}`, 68, 28);
+  ctx.font = 'bold 13px Orbitron, monospace';
+  ctx.fillText(`${coinScore}/100`, 68, 27);
   ctx.fillStyle = 'rgba(255,215,0,0.45)';
-  ctx.font = '8px Orbitron, monospace';
-  ctx.fillText('COINS', 68, 42);
+  ctx.font = '7px Orbitron, monospace';
+  ctx.fillText('COINS', 68, 40);
+
+  // Elapsed time box (center top)
+  const mins = Math.floor(elapsedSec / 60);
+  const secs = Math.floor(elapsedSec % 60);
+  const timeStr = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+  ctx.fillStyle = 'rgba(0,0,0,0.62)';
+  rr(W/2 - 42, 10, 84, 42, 6); ctx.fill();
+  ctx.strokeStyle = 'rgba(100,200,255,0.3)'; ctx.lineWidth = 0.5;
+  rr(W/2 - 42, 10, 84, 42, 6); ctx.stroke();
+  ctx.fillStyle = '#aaddff';
+  ctx.font = 'bold 14px Orbitron, monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(timeStr, W/2, 28);
+  ctx.fillStyle = 'rgba(100,200,255,0.45)';
+  ctx.font = '7px Orbitron, monospace';
+  ctx.fillText('TIME', W/2, 42);
+
+  // Distance progress bar
+  const pct = Math.min(distTravelled / FINISH_DIST, 1);
+  const barX = 10, barY = 62, barW = W - 20, barH = 6;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  rr(barX, barY, barW, barH, 3); ctx.fill();
+  // gradient fill
+  const pgrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
+  pgrad.addColorStop(0, '#1a8a3a');
+  pgrad.addColorStop(0.6, '#44cc44');
+  pgrad.addColorStop(1, '#ffdd57');
+  ctx.fillStyle = pgrad;
+  rr(barX, barY, Math.max(6, barW * pct), barH, 3); ctx.fill();
+  // finish flag icon at end
+  ctx.fillStyle = pct > 0.9 ? '#ffdd57' : 'rgba(255,255,255,0.3)';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('🏁', barX + barW + 12, barY + 8);
+  // distance label
+  const remM = Math.max(0, Math.round((FINISH_DIST - distTravelled) / 100));
+  ctx.fillStyle = 'rgba(200,255,200,0.55)';
+  ctx.font = '7px Orbitron, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`${remM}m remaining`, barX, barY + 18);
+  ctx.textAlign = 'left';
 }
 
-function drawOverlay(msg, sub) {
-  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+function drawFinishLine() {
+  if (finishLineY === null || finishLineY > H + 20 || finishLineY < -20) return;
+  const fy = finishLineY;
+  const sqSize = 14;
+  // Checkered pattern across full road width
+  for (let xi = 0; xi < Math.ceil(RW / sqSize); xi++) {
+    for (let yi = 0; yi < 2; yi++) {
+      const dark = (xi + yi) % 2 === 0;
+      ctx.fillStyle = dark ? '#111' : '#fff';
+      ctx.fillRect(RL + xi * sqSize, fy + yi * sqSize - sqSize, sqSize, sqSize);
+    }
+  }
+  // Glow line
+  ctx.strokeStyle = 'rgba(255,255,100,0.7)';
+  ctx.lineWidth = 2;
+  ctx.shadowColor = '#ffff00'; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.moveTo(RL - 14, fy); ctx.lineTo(RR + 14, fy); ctx.stroke();
+  ctx.shadowBlur = 0;
+  // FINISH label
+  ctx.fillStyle = '#ffff55';
+  ctx.font = 'bold 13px Orbitron, monospace';
+  ctx.textAlign = 'center';
+  ctx.shadowColor = '#ffff00'; ctx.shadowBlur = 8;
+  ctx.fillText('FINISH', LC, fy - 6);
+  ctx.shadowBlur = 0;
+  ctx.textAlign = 'left';
+}
+
+function drawScoreCard(isFinish) {
+  const coinRatio = (coinScore / COIN_SET_TOTAL).toFixed(2);
+  const cardCol = isFinish ? 'rgba(255,221,87,0.18)' : 'rgba(255,80,80,0.12)';
+  const borderCol = isFinish ? 'rgba(255,221,87,0.35)' : 'rgba(255,100,100,0.3)';
+
+  ctx.fillStyle = cardCol;
+  rr(W/2 - 170, H/2 - 64, 340, 158, 10); ctx.fill();
+  ctx.strokeStyle = borderCol; ctx.lineWidth = 0.8;
+  rr(W/2 - 170, H/2 - 64, 340, 158, 10); ctx.stroke();
+
+  ctx.font = '9px Orbitron, monospace';
+  ctx.textAlign = 'center';
+
+  if (isFinish) {
+    const speedRatio = 60 / elapsedSec;
+    const mins = Math.floor(elapsedSec / 60);
+    const secs = Math.floor(elapsedSec % 60);
+    const timeStr = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+
+    ctx.fillStyle = 'rgba(200,200,255,0.55)';
+    ctx.fillText('점수 = (60초 ÷ 통과시간) × 60 × (코인/100)', W/2, H/2 - 42);
+
+    ctx.fillStyle = '#aaddff';
+    ctx.font = '11px Orbitron, monospace';
+    ctx.fillText(`(60 ÷ ${Math.floor(elapsedSec)}초) × 60 × ${coinScore}/100`, W/2, H/2 - 18);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '10px Orbitron, monospace';
+    ctx.fillText(`= ${speedRatio.toFixed(3)} × 60 × ${coinRatio}`, W/2, H/2 + 4);
+  } else {
+    const progressRatio = distTravelled / FINISH_DIST;
+    const speedRatio = progressRatio > 0 ? (progressRatio * 60) / elapsedSec : 0;
+    const pct = (progressRatio * 100).toFixed(1);
+
+    ctx.fillStyle = 'rgba(200,200,255,0.55)';
+    ctx.fillText('점수 = (진행%×60초 ÷ 경과시간) × 60 × (코인/100)', W/2, H/2 - 42);
+
+    ctx.fillStyle = '#ffbbaa';
+    ctx.font = '11px Orbitron, monospace';
+    ctx.fillText(`(${pct}%×60 ÷ ${Math.floor(elapsedSec)}초) × 60 × ${coinScore}/100`, W/2, H/2 - 18);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '10px Orbitron, monospace';
+    ctx.fillText(`= ${speedRatio.toFixed(3)} × 60 × ${coinRatio}`, W/2, H/2 + 4);
+  }
+
+  // divider
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(W/2 - 110, H/2 + 14, 220, 0.5);
+
+  // Final score
+  const scoreCol = isFinish ? '#ffdd57' : '#ff9966';
+  ctx.fillStyle = scoreCol;
+  ctx.font = 'bold 34px Orbitron, monospace';
+  ctx.shadowColor = scoreCol; ctx.shadowBlur = 16;
+  ctx.fillText(`${finalScore} pts`, W/2, H/2 + 52);
+  ctx.shadowBlur = 0;
+
+  ctx.font = '8px Orbitron, monospace';
+  ctx.fillStyle = 'rgba(200,200,255,0.3)';
+  ctx.fillText('만점 60pts  (100km/h + 코인 100개)', W/2, H/2 + 68);
+
+  if (isFinish && finalScore >= hiFinishScore && finalScore > 0) {
+    ctx.fillStyle = '#ff3c00';
+    ctx.font = 'bold 10px Orbitron, monospace';
+    ctx.fillText('★  NEW BEST  ★', W/2, H/2 + 84);
+  } else {
+    ctx.fillStyle = 'rgba(200,200,255,0.35)';
+    ctx.font = '9px Orbitron, monospace';
+    ctx.fillText(`BEST  ${hiFinishScore} pts`, W/2, H/2 + 84);
+  }
+}
+
+function drawOverlay(msg, sub, isFinish) {
+  ctx.fillStyle = 'rgba(0,0,0,0.80)';
   ctx.fillRect(0, 0, W, H);
   ctx.textAlign = 'center';
 
-  // Title
-  ctx.fillStyle = msg === 'ROAD RUSH' ? '#ff3c00' : '#ff3c00';
-  ctx.font = 'bold 38px Orbitron, monospace';
-  ctx.shadowColor = '#ff3c00'; ctx.shadowBlur = 16;
-  ctx.fillText(msg, W/2, H/2 - 30);
+  const titleCol = isFinish ? '#ffdd57' : '#ff3c00';
+  ctx.fillStyle = titleCol;
+  ctx.font = 'bold 36px Orbitron, monospace';
+  ctx.shadowColor = titleCol; ctx.shadowBlur = 18;
+  ctx.fillText(msg, W/2, H/2 - 88);
   ctx.shadowBlur = 0;
 
-  // Sub
-  if (sub) {
-    ctx.fillStyle = 'rgba(200,200,255,0.75)';
-    ctx.font = '13px Orbitron, monospace';
-    ctx.fillText(sub, W/2, H/2 + 14);
-  }
-
-  if (state === 'over') {
-    ctx.fillStyle = '#ffdd57';
-    ctx.font = 'bold 16px Orbitron, monospace';
-    ctx.fillText(`COINS  ${coinScore}   BEST  ${hiScore}`, W/2, H/2 + 46);
+  if (state === 'over' || state === 'finish') {
+    drawScoreCard(isFinish);
+  } else {
+    if (sub) {
+      ctx.fillStyle = 'rgba(200,200,255,0.75)';
+      ctx.font = '12px Orbitron, monospace';
+      ctx.fillText(sub, W/2, H/2 + 10);
+    }
   }
 
   ctx.textAlign = 'left';
@@ -666,14 +878,16 @@ function loop() {
   ctx.clearRect(0, 0, W, H);
   drawRoad();
   trees.sort((a,b) => a.y - b.y).forEach(drawTree);
+  drawFinishLine();
   obstacles.forEach(o => drawCar(o.x, o.y, o.w, o.h, o.col, false));
   coins.forEach(drawCoin);
   if (state !== 'idle') drawCar(car.x, car.y, car.w, car.h, '#d42020', true);
   drawParticles();
 
   if (state === 'running') drawHUD();
-  if (state === 'idle') drawOverlay('ROAD RUSH', '← → 키로 조종 | 도로 이탈 / 충돌 시 게임 오버');
-  if (state === 'over') drawOverlay('GAME OVER', '도로 이탈 또는 충돌!');
+  if (state === 'idle') drawOverlay('ROAD RUSH', '← → 키로 조종 | 도로 이탈 / 충돌 시 게임 오버', false);
+  if (state === 'over') drawOverlay('GAME OVER', null, false);
+  if (state === 'finish') drawOverlay('🏁 GOAL!', null, true);
 
   requestAnimationFrame(loop);
 }
